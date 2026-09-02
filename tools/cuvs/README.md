@@ -16,6 +16,7 @@ default VSAG path used by seekdb.
 ```bash
 cd /root/oceanbase-competition-2026/seekdb-2026
 ./tools/cuvs/run_smoke.sh
+./tools/cuvs/run_c_api_smoke.sh
 ```
 
 The test builds a small HNSW index through cuVS's GPU CAGRA/HNSW path, runs a
@@ -28,6 +29,10 @@ nearest=42 distance=0
 
 The script accepts `CUDA_ROOT` and `CUVS_PREFIX` overrides when the toolkit or
 conda prefix is installed elsewhere.
+
+`run_c_api_smoke.sh` exercises the same path through cuVS's C API. This is the
+ABI intended for the eventual seekdb adaptor because it can be compiled as a
+normal C++ translation unit while cuVS owns CUDA/RMM resources.
 
 ## Why this is separate from SQL `LIB=VSAG`
 
