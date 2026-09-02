@@ -1,8 +1,8 @@
-# cuVS experimental backend
+# cuVS backend (opt-in)
 
-This directory is the first, independently runnable cuVS integration step for
-seekdb. It validates the NVIDIA GPU and the cuVS C++ ABI without changing the
-default VSAG path used by seekdb.
+This directory contains the opt-in cuVS backend for seekdb. The historical
+VSAG/OB paths remain unchanged unless a vector index explicitly uses
+`LIB=CUVS`.
 
 ## Environment used for validation
 
@@ -11,7 +11,18 @@ default VSAG path used by seekdb.
 - WSL CUDA toolkit: 13.0 (`nvcc` 13.0.88)
 - cuVS: 26.06.00, CUDA 13 package, installed at `/opt/cuvs-env`
 
-## Run the smoke test
+## Build seekdb with cuVS
+
+```bash
+cd /root/oceanbase-competition-2026/seekdb-2026
+./build.sh release --init -DOB_ENABLE_CUVS=ON -DCUVS_PREFIX=/opt/cuvs-env
+./build.sh release --make -j3
+```
+
+The build embeds `/opt/cuvs-env/lib` in the executable RPATH. Set
+`CUVS_PREFIX` to the installation prefix when using a different environment.
+
+## Run the standalone smoke tests
 
 ```bash
 cd /root/oceanbase-competition-2026/seekdb-2026
@@ -34,11 +45,30 @@ conda prefix is installed elsewhere.
 ABI intended for the eventual seekdb adaptor because it can be compiled as a
 normal C++ translation unit while cuVS owns CUDA/RMM resources.
 
-## Why this is separate from SQL `LIB=VSAG`
+## Use from SQL
 
-cuVS uses RAFT/RMM and GPU-resident index state, while seekdb's current VSAG
-adaptor owns CPU pointers, custom allocators, filtering callbacks, and snapshot
-serialization. Replacing `libvsag_static.a` with cuVS is therefore unsafe.
-The next implementation step is an opt-in `LIB=CUVS` adaptor for dense FP32
-HNSW/CAGRA only; VSAG remains the default and sparse/BQ/HGraph variants stay
-unchanged until their semantics and persistence are covered by tests.
+With a cuVS-enabled binary, create a dense FP32 HNSW index as follows:
+
+```sql
+CREATE TABLE cuvs_demo (
+  id BIGINT PRIMARY KEY,
+  embedding VECTOR(8),
+  VECTOR INDEX idx_embedding (embedding)
+    WITH (DISTANCE=L2, TYPE=HNSW, LIB=CUVS, M=16,
+          EF_CONSTRUCTION=100, EF_SEARCH=64)
+);
+```
+
+The adapter keeps seekdb's logical IDs and extra-info buffers, performs
+seekdb-compatible host-side filtering, supports CPU-hierarchy incremental
+extension, and stores cuVS's serialized graph together with seekdb metadata.
+Current scope is dense `float32` HNSW (including the HGRAPH representation
+used internally when extra-info filtering is enabled). Sparse, SQ/BQ, IVF,
+and hybrid indexes are rejected explicitly; use VSAG/OB for those forms.
+
+## Why this is separate from the default `LIB=VSAG`
+
+cuVS uses RAFT/RMM and GPU-resident index state, while seekdb's VSAG adaptor
+owns CPU pointers, custom allocators, filtering callbacks, and snapshot
+serialization. The opt-in adapter bridges those contracts without replacing
+`libvsag_static.a`; VSAG remains the default.

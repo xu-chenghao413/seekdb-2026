@@ -13,6 +13,19 @@ project("OceanBase"
   LANGUAGES CXX C ASM)
 
 option(OB_ENABLE_STANDBY "Build physical standby support" ON)
+option(OB_ENABLE_CUVS "Enable optional NVIDIA cuVS HNSW backend" OFF)
+set(CUVS_PREFIX "/opt/cuvs-env" CACHE PATH "cuVS installation prefix")
+if(OB_ENABLE_CUVS)
+  if(NOT EXISTS "${CUVS_PREFIX}/include/cuvs/core/c_api.h" OR
+     NOT EXISTS "${CUVS_PREFIX}/include/cuvs/neighbors/hnsw.h" OR
+     NOT EXISTS "${CUVS_PREFIX}/lib/libcuvs_c.so")
+    message(FATAL_ERROR "OB_ENABLE_CUVS requires cuVS C API under ${CUVS_PREFIX}")
+  endif()
+  add_compile_definitions(OB_ENABLE_CUVS=1)
+  set(CMAKE_BUILD_RPATH "${CUVS_PREFIX}/lib;${CMAKE_BUILD_RPATH}")
+  set(CMAKE_INSTALL_RPATH "${CUVS_PREFIX}/lib;${CMAKE_INSTALL_RPATH}")
+  message(STATUS "cuVS backend enabled: ${CUVS_PREFIX}")
+endif()
 option(ENABLE_SANITY "Build with seekdb memory Sanity instrumentation" OFF)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)

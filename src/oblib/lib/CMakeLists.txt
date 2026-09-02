@@ -70,6 +70,13 @@ if(ANDROID)
 else()
   target_link_directories(oblib_lib PUBLIC
     ${DEP_DIR}/lib ${DEP_DIR}/lib/vsag_lib)
+  if(OB_ENABLE_CUVS)
+    target_include_directories(oblib_lib PUBLIC
+      "${CUVS_PREFIX}/include"
+      "${CUVS_PREFIX}/targets/x86_64-linux/include")
+    target_link_directories(oblib_lib PUBLIC "${CUVS_PREFIX}/lib")
+    target_link_libraries(oblib_lib PUBLIC cuvs_c)
+  endif()
   if(UNIX)
     target_compile_options(oblib_lib PUBLIC -fopenmp)
   endif()

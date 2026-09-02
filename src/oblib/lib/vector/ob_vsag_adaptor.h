@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include <float.h>
+#include <iosfwd>
 #include <string>
 
 namespace oceanbase {
@@ -26,6 +27,7 @@ namespace common {
 namespace obvsag {
 
 typedef void* VectorIndexPtr;
+static constexpr uint64_t VSAG_HANDLER_MAGIC = 0x4f42565341474831ULL;
 extern bool is_init_;
 enum IndexType {
   INVALID_INDEX_TYPE = -1,
@@ -66,6 +68,8 @@ struct CreateIndexParam
   int window_size_ = 0;
   void *allocator_ = nullptr;
   bool is_sparse_ = false;
+  // 0 = VSAG (the historical default), 2 = optional cuVS backend.
+  int backend_ = 0;
 };
 
 class FilterInterface {
@@ -160,6 +164,58 @@ int get_extra_info_by_ids(VectorIndexPtr& index_handler,
 int immutable_optimize(VectorIndexPtr& index_handler);
 
 } // namesapce obvsag
+
+#ifdef OB_ENABLE_CUVS
+namespace obcuvs {
+static constexpr uint64_t CUVS_HANDLER_MAGIC = 0x4f42435556534831ULL;
+bool is_index(obvsag::VectorIndexPtr index_handler);
+int create_index(obvsag::VectorIndexPtr& index_handler, obvsag::IndexType index_type,
+                 const char *dtype, const char *metric, int dim, int max_degree,
+                 int ef_construction, int ef_search, void *allocator, int extra_info_size);
+int create_index(obvsag::VectorIndexPtr& index_handler, obvsag::IndexType index_type,
+                 const char *dtype, const char *metric, bool use_reorder,
+                 float doc_prune_ratio, int window_size, void *allocator, int extra_info_size);
+int validate_create_index(const obvsag::CreateIndexParam &param, std::string &err_msg);
+int build_index(obvsag::VectorIndexPtr index_handler, float *vectors, int64_t *ids,
+                int dim, int size, char *extra_infos);
+int build_index(obvsag::VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims,
+                float *vals, int64_t *ids, int size, char *extra_infos);
+int add_index(obvsag::VectorIndexPtr index_handler, float *vectors, int64_t *ids,
+              int dim, int size, char *extra_infos);
+int add_index(obvsag::VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims,
+              float *vals, int64_t *ids, int size, char *extra_infos);
+int get_index_number(obvsag::VectorIndexPtr index_handler, int64_t &size);
+int get_index_type(obvsag::VectorIndexPtr index_handler);
+int cal_distance_by_id(obvsag::VectorIndexPtr index_handler, const float *vector,
+                       const int64_t *ids, int64_t count, const float *&distances);
+int cal_distance_by_id(obvsag::VectorIndexPtr index_handler, uint32_t len, uint32_t *dims,
+                       float *vals, const int64_t *ids, int64_t count, const float *&distances);
+int get_vid_bound(obvsag::VectorIndexPtr index_handler, int64_t &min_vid, int64_t &max_vid);
+int get_extra_info_by_ids(obvsag::VectorIndexPtr &index_handler, const int64_t *ids,
+                          int64_t count, char *extra_infos);
+int knn_search(obvsag::VectorIndexPtr index_handler, float *query_vector, int dim,
+               int64_t topk, const float *&dist, const int64_t *&ids, int64_t &result_size,
+               int ef_search, bool need_extra_info, const char *&extra_infos,
+               void *invalid, bool reverse_filter, bool use_extra_info_filter,
+               float valid_ratio, void *allocator, float distance_threshold);
+int knn_search(obvsag::VectorIndexPtr index_handler, float *query_vector, int dim,
+               int64_t topk, const float *&dist, const int64_t *&ids, int64_t &result_size,
+               int ef_search, bool need_extra_info, const char *&extra_infos,
+               void *invalid, bool reverse_filter, bool use_extra_info_filter,
+               float valid_ratio, void *&iter_ctx, bool is_last_search, void *allocator);
+int knn_search(obvsag::VectorIndexPtr index_handler, uint32_t len, uint32_t *dims,
+               float *vals, int64_t topk, const float *&dist, const int64_t *&ids,
+               const char *&extra_infos, int64_t &result_size, float query_prune_ratio,
+               int64_t n_candidate, void *invalid, bool reverse_filter,
+               bool use_extra_info_filter, float valid_ratio, void *allocator,
+               bool need_extra_info);
+int fserialize(obvsag::VectorIndexPtr index_handler, std::ostream &out_stream);
+int fdeserialize(obvsag::VectorIndexPtr &index_handler, std::istream &in_stream);
+int delete_index(obvsag::VectorIndexPtr &index_handler);
+uint64_t estimate_memory(obvsag::VectorIndexPtr index_handler, uint64_t row_count, bool is_build);
+int immutable_optimize(obvsag::VectorIndexPtr &index_handler);
+}
+#endif
 } // namespace common
 } // namespace oceanbase
 

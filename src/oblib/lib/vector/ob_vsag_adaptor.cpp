@@ -29,6 +29,23 @@
 #include "lib/oblog/ob_log.h"
 #include "lib/worker.h"
 
+#ifdef OB_ENABLE_CUVS
+#include <cuvs/core/c_api.h>
+#include <cuvs/neighbors/hnsw.h>
+#include <dlpack/dlpack.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <strings.h>
+#include <unordered_map>
+#include <vector>
+#include <unistd.h>
+#endif
+
 namespace oceanbase {
 namespace common {
 namespace obvsag {
@@ -120,7 +137,7 @@ public:
                    IndexType index_type, std::shared_ptr<vsag::Index> index,
                    vsag::Allocator *allocator, uint64_t extra_info_size,
                    int16_t refine_type, int16_t bq_bits_query, bool bq_use_fht)
-      : is_created_(is_create), is_build_(is_build), use_static_(use_static),
+      : magic_(VSAG_HANDLER_MAGIC), is_created_(is_create), is_build_(is_build), use_static_(use_static),
         dtype_(dtype), metric_(metric), max_degree_(max_degree),
         ef_construction_(ef_construction), ef_search_(ef_search), dim_(dim),
         index_type_(index_type), index_(index), allocator_(allocator),
@@ -130,7 +147,7 @@ public:
   HnswIndexHandler(bool is_create, bool is_build, bool use_static, const char *dtype, const char *metric,
       IndexType index_type, std::shared_ptr<vsag::Index> index, vsag::Allocator *allocator, uint64_t extra_info_size,
       bool use_reorder, float doc_prune_ratio, int window_size)
-      : is_created_(is_create),
+      : magic_(VSAG_HANDLER_MAGIC), is_created_(is_create),
         is_build_(is_build),
         use_static_(use_static),
         dtype_(dtype),
@@ -198,6 +215,7 @@ public:
       K_(refine_type), K_(bq_bits_query), K_(bq_use_fht));
 
 private:
+  uint64_t magic_;
   bool is_created_;
   bool is_build_;
   bool use_static_;
@@ -1446,3 +1464,474 @@ int immutable_optimize(VectorIndexPtr& index_handler)
 } // namespace obvsag
 } // namespace common
 } // namespace oceanbase
+
+#ifdef OB_ENABLE_CUVS
+namespace oceanbase {
+namespace common {
+namespace obcuvs {
+
+namespace {
+
+static int cuvs_error(const char *where)
+{
+  const char *msg = cuvsGetLastErrorText();
+  int ret = OB_ERR_VSAG_RETURN_ERROR;
+  LOG_WARN("cuVS call failed", K(where), KP(msg), K(ret));
+  return ret;
+}
+
+static int check_cuvs(cuvsError_t status, const char *where)
+{
+  return status == CUVS_SUCCESS ? OB_SUCCESS : cuvs_error(where);
+}
+
+static bool parse_metric(const char *metric, cuvsDistanceType &result)
+{
+  if (metric == nullptr) {
+    return false;
+  } else if (0 == strcasecmp(metric, "l2")) {
+    result = L2Expanded;
+  } else if (0 == strcasecmp(metric, "cosine")) {
+    result = CosineExpanded;
+  } else if (0 == strcasecmp(metric, "ip") || 0 == strcasecmp(metric, "inner_product")) {
+    result = InnerProduct;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+static void init_tensor(DLManagedTensor &tensor, void *data, int64_t *shape,
+                        int ndim, DLDataType dtype)
+{
+  memset(&tensor, 0, sizeof(tensor));
+  tensor.dl_tensor.data = data;
+  tensor.dl_tensor.device.device_type = kDLCPU;
+  tensor.dl_tensor.device.device_id = 0;
+  tensor.dl_tensor.ndim = ndim;
+  tensor.dl_tensor.dtype = dtype;
+  tensor.dl_tensor.shape = shape;
+  tensor.dl_tensor.strides = nullptr;
+  tensor.dl_tensor.byte_offset = 0;
+}
+
+static DLDataType float32_dtype()
+{
+  DLDataType dtype;
+  dtype.code = kDLFloat;
+  dtype.bits = 32;
+  dtype.lanes = 1;
+  return dtype;
+}
+
+static DLDataType uint64_dtype()
+{
+  DLDataType dtype;
+  dtype.code = kDLUInt;
+  dtype.bits = 64;
+  dtype.lanes = 1;
+  return dtype;
+}
+
+class TempFile {
+public:
+  TempFile() : fd_(-1)
+  {
+    char name[] = "/tmp/seekdb-cuvs-XXXXXX";
+    fd_ = mkstemp(name);
+    if (fd_ >= 0) {
+      path_ = name;
+      close(fd_);
+      fd_ = -1;
+    }
+  }
+  ~TempFile() { if (!path_.empty()) { unlink(path_.c_str()); } }
+  bool valid() const { return !path_.empty(); }
+  const char *path() const { return path_.c_str(); }
+private:
+  int fd_;
+  std::string path_;
+};
+
+class CuvsIndexHandler {
+public:
+  CuvsIndexHandler(int &ret, obvsag::IndexType index_type, const char *dtype,
+                   const char *metric, int dim, int max_degree,
+                   int ef_construction, int ef_search, int extra_info_size)
+      : magic_(CUVS_HANDLER_MAGIC), built_(false), immutable_(false), dim_(dim),
+        max_degree_(max_degree), ef_construction_(ef_construction),
+        ef_search_(ef_search), index_type_(index_type),
+        extra_info_size_(extra_info_size), resources_(0), index_(nullptr),
+        index_params_(nullptr), ace_params_(nullptr), search_params_(nullptr)
+  {
+    ret = OB_SUCCESS;
+    if (!parse_metric(metric, metric_)) {
+      ret = OB_NOT_SUPPORTED;
+    } else if (0 != strcasecmp(dtype == nullptr ? "" : dtype, "float32")) {
+      ret = OB_NOT_SUPPORTED;
+    } else if (OB_FAIL(check_cuvs(cuvsResourcesCreate(&resources_), "resources"))) {
+    } else if (OB_FAIL(check_cuvs(cuvsHnswAceParamsCreate(&ace_params_), "ace params"))) {
+    } else if (OB_FAIL(check_cuvs(cuvsHnswIndexParamsCreate(&index_params_), "index params"))) {
+    } else if (OB_FAIL(check_cuvs(cuvsHnswIndexCreate(&index_), "index"))) {
+    } else if (OB_FAIL(check_cuvs(cuvsHnswSearchParamsCreate(&search_params_), "search params"))) {
+    } else {
+      index_params_->hierarchy = CPU;
+      index_params_->M = static_cast<size_t>(max_degree_);
+      index_params_->ef_construction = ef_construction_;
+      index_params_->metric = metric_;
+      index_params_->ace_params = ace_params_;
+      search_params_->ef = ef_search_;
+      search_params_->num_threads = 0;
+    }
+    if (OB_FAIL(ret)) {
+      cleanup();
+    }
+  }
+
+  ~CuvsIndexHandler() { cleanup(); }
+
+  int build(float *vectors, int64_t *ids, int dim, int size, char *extra_infos)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (vectors == nullptr || ids == nullptr || dim != dim_ || size < 0) {
+      return OB_INVALID_ARGUMENT;
+    }
+    if (built_) {
+      return OB_ERR_UNEXPECTED;
+    }
+    int64_t shape[2] = {size, dim};
+    DLManagedTensor dataset;
+    init_tensor(dataset, vectors, shape, 2, float32_dtype());
+    int ret = check_cuvs(cuvsHnswBuild(resources_, index_params_, &dataset, index_), "build");
+    if (OB_SUCC(ret)) {
+      copy_rows(vectors, ids, extra_infos, size);
+      built_ = true;
+    }
+    return ret;
+  }
+
+  int add(float *vectors, int64_t *ids, int dim, int size, char *extra_infos)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (vectors == nullptr || ids == nullptr || dim != dim_ || size < 0) {
+      return OB_INVALID_ARGUMENT;
+    }
+    if (!built_) {
+      int64_t shape[2] = {size, dim};
+      DLManagedTensor dataset;
+      init_tensor(dataset, vectors, shape, 2, float32_dtype());
+      int ret = check_cuvs(cuvsHnswBuild(resources_, index_params_, &dataset, index_), "build");
+      if (OB_FAIL(ret)) { return ret; }
+      copy_rows(vectors, ids, extra_infos, size);
+      built_ = true;
+      return OB_SUCCESS;
+    }
+    cuvsHnswExtendParams_t params = nullptr;
+    int ret = check_cuvs(cuvsHnswExtendParamsCreate(&params), "extend params");
+    if (OB_SUCC(ret)) {
+      params->num_threads = 0;
+      int64_t shape[2] = {size, dim};
+      DLManagedTensor dataset;
+      init_tensor(dataset, vectors, shape, 2, float32_dtype());
+      ret = check_cuvs(cuvsHnswExtend(resources_, params, &dataset, index_), "extend");
+    }
+    if (params != nullptr) { cuvsHnswExtendParamsDestroy(params); }
+    if (OB_SUCC(ret)) { copy_rows(vectors, ids, extra_infos, size); }
+    return ret;
+  }
+
+  int search(float *query, int dim, int64_t topk, const float *&dist,
+             const int64_t *&ids, int64_t &result_size, int ef_search,
+             bool need_extra_info, const char *&extra_infos,
+             obvsag::FilterInterface *filter, bool reverse_filter,
+             bool use_extra_info_filter, float valid_ratio, float distance_threshold)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    dist = nullptr;
+    ids = nullptr;
+    extra_infos = nullptr;
+    result_size = 0;
+    if (query == nullptr || dim != dim_ || topk <= 0) { return OB_INVALID_ARGUMENT; }
+    if (!built_ || ids_.empty()) { return OB_SUCCESS; }
+    const int64_t count = static_cast<int64_t>(ids_.size());
+    int64_t candidate = std::max<int64_t>(topk, ef_search > 0 ? ef_search : ef_search_);
+    if (valid_ratio > 0.0f && valid_ratio < 1.0f) {
+      candidate = std::max<int64_t>(candidate, static_cast<int64_t>(std::ceil(topk / std::max(valid_ratio, 0.05f))));
+    }
+    candidate = std::min<int64_t>(count, candidate);
+    search_params_->ef = static_cast<int32_t>(std::min<int64_t>(candidate, INT32_MAX));
+    std::vector<uint64_t> neighbors(static_cast<size_t>(candidate));
+    std::vector<float> distances(static_cast<size_t>(candidate));
+    int64_t qshape[2] = {1, dim};
+    int64_t oshape[2] = {1, candidate};
+    DLManagedTensor queries, neighbor_tensor, distance_tensor;
+    init_tensor(queries, query, qshape, 2, float32_dtype());
+    init_tensor(neighbor_tensor, neighbors.data(), oshape, 2, uint64_dtype());
+    init_tensor(distance_tensor, distances.data(), oshape, 2, float32_dtype());
+    int ret = check_cuvs(cuvsHnswSearch(resources_, search_params_, index_, &queries,
+                                         &neighbor_tensor, &distance_tensor), "search");
+    if (OB_FAIL(ret)) { return ret; }
+    result_ids_.clear();
+    result_distances_.clear();
+    result_extra_infos_.clear();
+    for (int64_t i = 0; i < candidate && static_cast<size_t>(neighbors[i]) < ids_.size(); ++i) {
+      size_t row = static_cast<size_t>(neighbors[i]);
+      bool keep = true;
+      if (filter != nullptr) {
+        bool blocked = use_extra_info_filter && extra_info_size_ > 0
+          ? filter->test(extra_infos_.data() + row * extra_info_size_)
+          : filter->test(ids_[row]);
+        keep = reverse_filter ? blocked : !blocked;
+      }
+      if (distance_threshold != FLT_MAX && distances[i] > distance_threshold) { keep = false; }
+      if (keep) {
+        result_ids_.push_back(ids_[row]);
+        result_distances_.push_back(distances[i]);
+        if (need_extra_info && extra_info_size_ > 0) {
+          result_extra_infos_.insert(result_extra_infos_.end(),
+                                     extra_infos_.begin() + row * extra_info_size_,
+                                     extra_infos_.begin() + (row + 1) * extra_info_size_);
+        }
+        if (static_cast<int64_t>(result_ids_.size()) >= topk) { break; }
+      }
+    }
+    result_size = static_cast<int64_t>(result_ids_.size());
+    dist = result_distances_.empty() ? nullptr : result_distances_.data();
+    ids = result_ids_.empty() ? nullptr : result_ids_.data();
+    extra_infos = result_extra_infos_.empty() ? nullptr : result_extra_infos_.data();
+    return OB_SUCCESS;
+  }
+
+  int distance(const float *query, const int64_t *ids, int64_t count, const float *&distances)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (query == nullptr || ids == nullptr || count < 0) { return OB_INVALID_ARGUMENT; }
+    distance_results_.resize(static_cast<size_t>(count));
+    for (int64_t i = 0; i < count; ++i) {
+      auto it = id_to_row_.find(ids[i]);
+      if (it == id_to_row_.end()) {
+        distance_results_[i] = std::numeric_limits<float>::max();
+        continue;
+      }
+      const float *base = vectors_.data() + it->second * dim_;
+      float dot = 0.0f, qnorm = 0.0f, bnorm = 0.0f, l2 = 0.0f;
+      for (int j = 0; j < dim_; ++j) {
+        float q = query[j], b = base[j];
+        dot += q * b; qnorm += q * q; bnorm += b * b; l2 += (q - b) * (q - b);
+      }
+      if (metric_ == L2Expanded) { distance_results_[i] = l2; }
+      else if (metric_ == CosineExpanded) {
+        distance_results_[i] = (qnorm == 0.0f || bnorm == 0.0f) ? 1.0f : 1.0f - dot / std::sqrt(qnorm * bnorm);
+      } else { distance_results_[i] = -dot; }
+    }
+    distances = distance_results_.data();
+    return OB_SUCCESS;
+  }
+
+  int extra(const int64_t *ids, int64_t count, char *out)
+  {
+    if (ids == nullptr || out == nullptr || count < 0) { return OB_INVALID_ARGUMENT; }
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (extra_info_size_ == 0) { return OB_SUCCESS; }
+    for (int64_t i = 0; i < count; ++i) {
+      auto it = id_to_row_.find(ids[i]);
+      if (it == id_to_row_.end()) { memset(out + i * extra_info_size_, 0, extra_info_size_); }
+      else { memcpy(out + i * extra_info_size_, extra_infos_.data() + it->second * extra_info_size_, extra_info_size_); }
+    }
+    return OB_SUCCESS;
+  }
+
+  int serialize(std::ostream &out)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!built_) { return OB_OP_NOT_ALLOW; }
+    TempFile file;
+    if (!file.valid()) { return OB_ERR_UNEXPECTED; }
+    int ret = check_cuvs(cuvsHnswSerialize(resources_, file.path(), index_), "serialize");
+    if (OB_FAIL(ret)) { return ret; }
+    std::ifstream in(file.path(), std::ios::binary | std::ios::ate);
+    if (!in.good()) { return OB_ERR_UNEXPECTED; }
+    uint64_t blob_size = static_cast<uint64_t>(in.tellg());
+    in.seekg(0);
+    const uint32_t magic = 0x53444355U, version = 1;
+    const uint32_t type = static_cast<uint32_t>(index_type_);
+    const uint32_t metric = static_cast<uint32_t>(metric_);
+    const uint64_t count = ids_.size(), extra = extra_info_size_;
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    out.write(reinterpret_cast<const char*>(&type), sizeof(type));
+    out.write(reinterpret_cast<const char*>(&metric), sizeof(metric));
+    out.write(reinterpret_cast<const char*>(&dim_), sizeof(dim_));
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    out.write(reinterpret_cast<const char*>(&extra), sizeof(extra));
+    out.write(reinterpret_cast<const char*>(&blob_size), sizeof(blob_size));
+    std::vector<char> buf(1 << 20);
+    while (in.good()) { in.read(buf.data(), buf.size()); std::streamsize n = in.gcount(); if (n > 0) out.write(buf.data(), n); }
+    if (!ids_.empty()) out.write(reinterpret_cast<const char*>(ids_.data()), sizeof(int64_t) * ids_.size());
+    if (!vectors_.empty()) out.write(reinterpret_cast<const char*>(vectors_.data()), sizeof(float) * vectors_.size());
+    if (!extra_infos_.empty()) out.write(extra_infos_.data(), extra_infos_.size());
+    return out.good() ? OB_SUCCESS : OB_ERR_UNEXPECTED;
+  }
+
+  int deserialize(std::istream &in)
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    uint32_t magic = 0, version = 0, type = 0, metric = 0;
+    int dim = 0; uint64_t count = 0, extra = 0, blob_size = 0;
+    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&type), sizeof(type));
+    in.read(reinterpret_cast<char*>(&metric), sizeof(metric));
+    in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+    in.read(reinterpret_cast<char*>(&count), sizeof(count));
+    in.read(reinterpret_cast<char*>(&extra), sizeof(extra));
+    in.read(reinterpret_cast<char*>(&blob_size), sizeof(blob_size));
+    if (!in.good() || magic != 0x53444355U || version != 1 || dim != dim_ || extra != extra_info_size_ || type != static_cast<uint32_t>(index_type_) || metric != static_cast<uint32_t>(metric_)) {
+      return OB_INVALID_ARGUMENT;
+    }
+    TempFile file;
+    if (!file.valid()) { return OB_ERR_UNEXPECTED; }
+    std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
+    std::vector<char> buf(1 << 20);
+    uint64_t left = blob_size;
+    while (left > 0) { std::streamsize want = static_cast<std::streamsize>(std::min<uint64_t>(left, buf.size())); in.read(buf.data(), want); if (in.gcount() != want) return OB_ERR_UNEXPECTED; out.write(buf.data(), want); left -= static_cast<uint64_t>(want); }
+    out.close();
+    int ret = check_cuvs(cuvsHnswDeserialize(resources_, index_params_, file.path(), dim_, metric_, index_), "deserialize");
+    if (OB_FAIL(ret)) { return ret; }
+    ids_.resize(static_cast<size_t>(count));
+    vectors_.resize(static_cast<size_t>(count) * dim_);
+    extra_infos_.resize(static_cast<size_t>(count) * extra_info_size_);
+    if (count > 0) in.read(reinterpret_cast<char*>(ids_.data()), sizeof(int64_t) * count);
+    if (count > 0) in.read(reinterpret_cast<char*>(vectors_.data()), sizeof(float) * count * dim_);
+    if (!extra_infos_.empty()) in.read(extra_infos_.data(), extra_infos_.size());
+    if (!in.good()) { return OB_ERR_UNEXPECTED; }
+    id_to_row_.clear();
+    for (size_t i = 0; i < ids_.size(); ++i) { id_to_row_[ids_[i]] = i; }
+    built_ = true;
+    return OB_SUCCESS;
+  }
+
+  int number(int64_t &size) const { std::lock_guard<std::mutex> guard(mutex_); size = ids_.size(); return OB_SUCCESS; }
+  int type() const { return static_cast<int>(index_type_); }
+  int bounds(int64_t &min_id, int64_t &max_id) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (ids_.empty()) { min_id = max_id = 0; return OB_SUCCESS; }
+    auto mm = std::minmax_element(ids_.begin(), ids_.end()); min_id = *mm.first; max_id = *mm.second; return OB_SUCCESS;
+  }
+  uint64_t memory(uint64_t row_count) const { return row_count * (static_cast<uint64_t>(dim_) * sizeof(float) + sizeof(int64_t) + extra_info_size_ + static_cast<uint64_t>(max_degree_) * sizeof(uint64_t)); }
+  int optimize() { immutable_ = true; return OB_SUCCESS; }
+
+private:
+  void copy_rows(const float *vectors, const int64_t *ids, const char *extra_infos, int size)
+  {
+    size_t old = ids_.size();
+    ids_.insert(ids_.end(), ids, ids + size);
+    vectors_.insert(vectors_.end(), vectors, vectors + static_cast<size_t>(size) * dim_);
+    if (extra_info_size_ > 0) {
+      if (extra_infos != nullptr) extra_infos_.insert(extra_infos_.end(), extra_infos, extra_infos + static_cast<size_t>(size) * extra_info_size_);
+      else extra_infos_.resize(extra_infos_.size() + static_cast<size_t>(size) * extra_info_size_, 0);
+    }
+    for (size_t i = old; i < ids_.size(); ++i) { id_to_row_[ids_[i]] = i; }
+  }
+  void cleanup()
+  {
+    if (search_params_ != nullptr) { cuvsHnswSearchParamsDestroy(search_params_); search_params_ = nullptr; }
+    if (index_ != nullptr) { cuvsHnswIndexDestroy(index_); index_ = nullptr; }
+    if (index_params_ != nullptr) { cuvsHnswIndexParamsDestroy(index_params_); index_params_ = nullptr; }
+    if (ace_params_ != nullptr) { cuvsHnswAceParamsDestroy(ace_params_); ace_params_ = nullptr; }
+    if (resources_ != 0) { cuvsResourcesDestroy(resources_); resources_ = 0; }
+  }
+  uint64_t magic_;
+  bool built_, immutable_;
+  int dim_, max_degree_, ef_construction_, ef_search_;
+  obvsag::IndexType index_type_;
+  int extra_info_size_;
+  cuvsDistanceType metric_;
+  cuvsResources_t resources_;
+  cuvsHnswIndex_t index_;
+  cuvsHnswIndexParams_t index_params_;
+  cuvsHnswAceParams_t ace_params_;
+  cuvsHnswSearchParams_t search_params_;
+  std::vector<int64_t> ids_;
+  std::vector<float> vectors_;
+  std::vector<char> extra_infos_;
+  std::unordered_map<int64_t, size_t> id_to_row_;
+  std::vector<float> result_distances_;
+  std::vector<int64_t> result_ids_;
+  std::vector<char> result_extra_infos_;
+  std::vector<float> distance_results_;
+  mutable std::mutex mutex_;
+};
+
+static CuvsIndexHandler *handler(obvsag::VectorIndexPtr ptr)
+{
+  return static_cast<CuvsIndexHandler *>(ptr);
+}
+
+} // namespace
+
+bool is_index(obvsag::VectorIndexPtr index_handler)
+{
+  return index_handler != nullptr && *static_cast<const uint64_t *>(index_handler) == CUVS_HANDLER_MAGIC;
+}
+
+int validate_create_index(const obvsag::CreateIndexParam &param, std::string &err_msg)
+{
+  err_msg.clear();
+  if (param.is_sparse_) { err_msg = "cuVS supports dense float32 indexes only"; return OB_NOT_SUPPORTED; }
+  if (param.index_type_ != obvsag::HNSW_TYPE && param.index_type_ != obvsag::HGRAPH_TYPE) { err_msg = "cuVS supports HNSW indexes only"; return OB_NOT_SUPPORTED; }
+  if (param.dtype_ == nullptr || strcasecmp(param.dtype_, "float32") != 0) { err_msg = "cuVS requires float32 vectors"; return OB_NOT_SUPPORTED; }
+  if (param.dim_ <= 0 || param.dim_ > 4096) { err_msg = "invalid vector dimension for cuVS"; return OB_INVALID_ARGUMENT; }
+  if (param.max_degree_ < 5 || param.ef_construction_ <= param.max_degree_ || param.ef_search_ <= 0) { err_msg = "invalid HNSW parameters for cuVS"; return OB_INVALID_ARGUMENT; }
+  cuvsDistanceType metric;
+  if (!parse_metric(param.metric_, metric)) { err_msg = "unsupported metric for cuVS"; return OB_NOT_SUPPORTED; }
+  return OB_SUCCESS;
+}
+
+int create_index(obvsag::VectorIndexPtr &index_handler, obvsag::IndexType index_type,
+                 const char *dtype, const char *metric, int dim, int max_degree,
+                 int ef_construction, int ef_search, void *, int extra_info_size)
+{
+  obvsag::CreateIndexParam param;
+  param.index_type_ = index_type; param.dtype_ = dtype; param.metric_ = metric; param.dim_ = dim;
+  param.max_degree_ = max_degree; param.ef_construction_ = ef_construction; param.ef_search_ = ef_search;
+  param.extra_info_size_ = extra_info_size; param.backend_ = 2;
+  std::string err;
+  int ret = obcuvs::validate_create_index(param, err);
+  if (OB_FAIL(ret)) { LOG_WARN("invalid cuVS index parameters", K(ret), KCSTRING(err.c_str())); return ret; }
+  int create_ret = OB_SUCCESS;
+  CuvsIndexHandler *index = new CuvsIndexHandler(create_ret, index_type, dtype, metric, dim, max_degree, ef_construction, ef_search, extra_info_size);
+  if (index == nullptr) { return OB_ALLOCATE_MEMORY_FAILED; }
+  if (OB_FAIL(create_ret)) { delete index; return create_ret; }
+  index_handler = static_cast<obvsag::VectorIndexPtr>(index);
+  return OB_SUCCESS;
+}
+
+int create_index(obvsag::VectorIndexPtr &, obvsag::IndexType, const char *, const char *, bool, float, int, void *, int)
+{ return OB_NOT_SUPPORTED; }
+int build_index(obvsag::VectorIndexPtr ptr, float *v, int64_t *ids, int dim, int size, char *extra) { return is_index(ptr) ? handler(ptr)->build(v, ids, dim, size, extra) : OB_INVALID_ARGUMENT; }
+int build_index(obvsag::VectorIndexPtr &, uint32_t *, uint32_t *, float *, int64_t *, int, char *) { return OB_NOT_SUPPORTED; }
+int add_index(obvsag::VectorIndexPtr ptr, float *v, int64_t *ids, int dim, int size, char *extra) { return is_index(ptr) ? handler(ptr)->add(v, ids, dim, size, extra) : OB_INVALID_ARGUMENT; }
+int add_index(obvsag::VectorIndexPtr &, uint32_t *, uint32_t *, float *, int64_t *, int, char *) { return OB_NOT_SUPPORTED; }
+int get_index_number(obvsag::VectorIndexPtr ptr, int64_t &size) { return is_index(ptr) ? handler(ptr)->number(size) : OB_INVALID_ARGUMENT; }
+int get_index_type(obvsag::VectorIndexPtr ptr) { return is_index(ptr) ? handler(ptr)->type() : OB_INVALID_ARGUMENT; }
+int cal_distance_by_id(obvsag::VectorIndexPtr ptr, const float *v, const int64_t *ids, int64_t count, const float *&dist) { return is_index(ptr) ? handler(ptr)->distance(v, ids, count, dist) : OB_INVALID_ARGUMENT; }
+int cal_distance_by_id(obvsag::VectorIndexPtr, uint32_t, uint32_t *, float *, const int64_t *, int64_t, const float *&) { return OB_NOT_SUPPORTED; }
+int get_vid_bound(obvsag::VectorIndexPtr ptr, int64_t &min_id, int64_t &max_id) { return is_index(ptr) ? handler(ptr)->bounds(min_id, max_id) : OB_INVALID_ARGUMENT; }
+int get_extra_info_by_ids(obvsag::VectorIndexPtr &ptr, const int64_t *ids, int64_t count, char *out) { return is_index(ptr) ? handler(ptr)->extra(ids, count, out) : OB_INVALID_ARGUMENT; }
+int knn_search(obvsag::VectorIndexPtr ptr, float *query, int dim, int64_t topk, const float *&dist, const int64_t *&ids, int64_t &size, int ef, bool need, const char *&extra, void *invalid, bool reverse, bool extra_filter, float ratio, void *, float threshold)
+{ return is_index(ptr) ? handler(ptr)->search(query, dim, topk, dist, ids, size, ef, need, extra, static_cast<obvsag::FilterInterface *>(invalid), reverse, extra_filter, ratio, threshold) : OB_INVALID_ARGUMENT; }
+int knn_search(obvsag::VectorIndexPtr ptr, float *query, int dim, int64_t topk, const float *&dist, const int64_t *&ids, int64_t &size, int ef, bool need, const char *&extra, void *invalid, bool reverse, bool extra_filter, float ratio, void *&iter, bool last, void *alloc)
+{ iter = nullptr; return knn_search(ptr, query, dim, topk, dist, ids, size, ef, need, extra, invalid, reverse, extra_filter, ratio, alloc, FLT_MAX); }
+int knn_search(obvsag::VectorIndexPtr, uint32_t, uint32_t *, float *, int64_t, const float *&, const int64_t *&, const char *&, int64_t &, float, int64_t, void *, bool, bool, float, void *, bool)
+{ return OB_NOT_SUPPORTED; }
+int fserialize(obvsag::VectorIndexPtr ptr, std::ostream &out) { return is_index(ptr) ? handler(ptr)->serialize(out) : OB_INVALID_ARGUMENT; }
+int fdeserialize(obvsag::VectorIndexPtr &ptr, std::istream &in) { return is_index(ptr) ? handler(ptr)->deserialize(in) : OB_INVALID_ARGUMENT; }
+int delete_index(obvsag::VectorIndexPtr &ptr) { if (!is_index(ptr)) return OB_INVALID_ARGUMENT; delete handler(ptr); ptr = nullptr; return OB_SUCCESS; }
+uint64_t estimate_memory(obvsag::VectorIndexPtr ptr, uint64_t rows, bool) { return is_index(ptr) ? handler(ptr)->memory(rows) : 0; }
+int immutable_optimize(obvsag::VectorIndexPtr &ptr) { return is_index(ptr) ? handler(ptr)->optimize() : OB_INVALID_ARGUMENT; }
+
+} // namespace obcuvs
+} // namespace common
+} // namespace oceanbase
+#endif

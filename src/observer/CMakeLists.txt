@@ -55,7 +55,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       -Wl,--no-whole-archive
       sql_nio
       -static-libgcc
-      -static-libstdc++)
+      $<$<NOT:$<BOOL:${OB_ENABLE_CUVS}>>:-static-libstdc++>)
   endif()
 
   if(STDC_SHARED_LIB)
@@ -99,7 +99,7 @@ target_link_libraries(seekdb PRIVATE
   $<$<PLATFORM_ID:Windows>:synchronization>
   $<$<AND:$<NOT:$<PLATFORM_ID:Darwin>>,$<NOT:$<PLATFORM_ID:Windows>>>:-Wl,--end-group>
   $<$<PLATFORM_ID:Linux>:-static-libgcc>
-  $<$<PLATFORM_ID:Linux>:-static-libstdc++>
+  $<$<AND:$<PLATFORM_ID:Linux>,$<NOT:$<BOOL:${OB_ENABLE_CUVS}>>>:-static-libstdc++>
   ${link_malloc_hook})
 
 if(ENABLE_SANITY)
@@ -148,7 +148,7 @@ endif()
 
 configure_file(../share/ob_version.cpp.in ob_version.cpp)
 
-if(STDC_SHARED_LIB)
+if(STDC_SHARED_LIB AND NOT OB_ENABLE_CUVS)
   get_filename_component(STDC_SHARED_LIB_DIR ${STDC_SHARED_LIB} DIRECTORY)
   target_link_options(seekdb PRIVATE "-Wl,-rpath=${STDC_SHARED_LIB_DIR}")
 endif()

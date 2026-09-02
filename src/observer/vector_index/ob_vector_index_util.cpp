@@ -133,7 +133,8 @@ static int validate_vector_index_vsag_create_index_param(
     const bool bq_use_fht,
     const bool refine_value,
     const double drop_ratio_build,
-    const int64_t window_size)
+    const int64_t window_size,
+    const ObVectorIndexAlgorithmLib lib)
 {
   int ret = OB_SUCCESS;
   const char *metric = nullptr;
@@ -152,6 +153,7 @@ static int validate_vector_index_vsag_create_index_param(
              ObVectorIndexAlgorithmType::VIAT_HNSW_SQ == index_type ||
              ObVectorIndexAlgorithmType::VIAT_HNSW_BQ == index_type) {
     obvectorutil::CreateIndexParam param;
+    param.backend_ = lib == ObVectorIndexAlgorithmLib::VIAL_CUVS ? 2 : 0;
     param.dtype_ = "float32";
     param.metric_ = metric;
     param.dim_ = static_cast<int>(dim);
@@ -264,6 +266,8 @@ int ObVectorIndexUtil::parser_params_from_string(
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_VSAG;
           } else if (new_param_value == "OB") {
             param.lib_ = ObVectorIndexAlgorithmLib::VIAL_OB;
+          } else if (new_param_value == "CUVS") {
+            param.lib_ = ObVectorIndexAlgorithmLib::VIAL_CUVS;
           } else {
             ret = OB_NOT_SUPPORTED;
             LOG_WARN("not support vector index lib", K(ret), K(new_param_value));
@@ -1104,6 +1108,8 @@ int ObVectorIndexUtil::construct_rebuild_index_param(
         tmp_lib = ObString("VSAG");
       } else if (old_vec_param.lib_ == ObVectorIndexAlgorithmLib::VIAL_OB) {
         tmp_lib = ObString("OB");
+      } else if (old_vec_param.lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS) {
+        tmp_lib = ObString("CUVS");
       } else {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected old vec param lib", K(ret), K(old_vec_param.lib_));
@@ -3530,10 +3536,16 @@ int ObVectorIndexUtil::check_index_param(
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "this value of vector index m is");
         }
         if (OB_FAIL(ret)) {
-        } else if (lib_is_set && lib_name != "VSAG") {
+        } else if (lib_is_set && lib_name != "VSAG" && lib_name != "CUVS") {
           ret = OB_NOT_SUPPORTED;
-          LOG_WARN("hnsw vector index name should be 'VSAG'", K(ret));
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' is");
+          LOG_WARN("hnsw vector index name should be 'VSAG' or 'CUVS'", K(ret));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' or 'CUVS' is");
+        }
+        if (OB_SUCC(ret) && lib_is_set && lib_name == "CUVS" &&
+            (type_hnsw_sq_is_set || type_hnsw_bq_is_set || type_hybrid_vec_is_set || is_sparse_vec)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("cuVS supports dense float32 HNSW only", K(ret));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "cuVS supports dense float32 HNSW only");
         }
         if (OB_FAIL(ret)) {
         } else if (ef_construction_value <= m_value) {
@@ -3621,7 +3633,8 @@ int ObVectorIndexUtil::check_index_param(
                                                                         bq_use_fht_value,
                                                                         false,
                                                                         0,
-                                                                        ObVectorIndexParam::DEFAULT_WINDOW_SIZE))) {
+                                                                        ObVectorIndexParam::DEFAULT_WINDOW_SIZE,
+                                                                        lib_is_set && lib_name == "CUVS" ? ObVectorIndexAlgorithmLib::VIAL_CUVS : ObVectorIndexAlgorithmLib::VIAL_VSAG))) {
           LOG_WARN("failed to validate hnsw vsag create index params",
               K(ret), K(vsag_index_type), K(distance_name),
               K(vector_dim), K(dim_value), K(m_value), K(ef_construction_value),
@@ -3706,7 +3719,8 @@ int ObVectorIndexUtil::check_index_param(
                                                                         false,
                                                                         refine_value,
                                                                         drop_ratio_build,
-                                                                        ObVectorIndexParam::DEFAULT_WINDOW_SIZE))) {
+                                                                        ObVectorIndexParam::DEFAULT_WINDOW_SIZE,
+                                                                        ObVectorIndexAlgorithmLib::VIAL_VSAG))) {
         }
       }
     }

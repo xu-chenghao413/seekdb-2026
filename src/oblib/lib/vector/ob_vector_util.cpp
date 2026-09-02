@@ -83,11 +83,19 @@ int create_index(obvsag::VectorIndexPtr& index_handler, int index_type,
                  int max_degree, int ef_construction, int ef_search,
                  void* allocator, int extra_info_size /*= 0*/,
                  int16_t refine_type /*= 0*/, int16_t bq_bits_query /*= 32*/,
-                 bool bq_use_fht /*= false*/)
+                 bool bq_use_fht /*= false*/, int index_lib /*= 0*/)
 {
   obvsag::set_block_size_limit(2*1024*1024);
   LOG_INFO("vector index create params: ", K(index_type), K(dim), KCSTRING(dtype), KCSTRING(metric), K(max_degree), K(ef_construction), K(ef_search),
       KP(allocator), K(extra_info_size), K(refine_type), K(bq_bits_query), K(bq_use_fht));
+#ifdef OB_ENABLE_CUVS
+  if (index_lib == 2) {
+    return obcuvs::create_index(index_handler, static_cast<obvsag::IndexType>(index_type), dtype, metric,
+                                dim, max_degree, ef_construction, ef_search, allocator, extra_info_size);
+  }
+#else
+  if (index_lib == 2) return OB_NOT_SUPPORTED;
+#endif
   return obvsag::create_index(index_handler,
                                    static_cast<obvsag::IndexType>(index_type),
                                    dtype, metric,
@@ -110,14 +118,32 @@ int validate_create_index(const CreateIndexParam &param, std::string &err_msg)
       K(param.ef_construction_), K(param.ef_search_), K(param.extra_info_size_),
       K(param.refine_type_), K(param.bq_bits_query_), K(param.bq_use_fht_),
       K(param.use_reorder_), K(param.doc_prune_ratio_), K(param.window_size_), KP(param.allocator_));
+#ifdef OB_ENABLE_CUVS
+  if (param.backend_ == 2) {
+    return obcuvs::validate_create_index(param, err_msg);
+  }
+#else
+  if (param.backend_ == 2) {
+    err_msg = "cuVS backend was not compiled";
+    return OB_NOT_SUPPORTED;
+  }
+#endif
   return obvsag::validate_create_index(param, err_msg);
 }
 
 int create_index(obvsag::VectorIndexPtr &index_handler, int index_type, const char *dtype, const char *metric,
-    bool use_reorder, float doc_prune_ratio, int window_size, void *allocator, int extra_info_size /* 0 */)
+    bool use_reorder, float doc_prune_ratio, int window_size, void *allocator, int extra_info_size /* 0 */, int index_lib /* 0 */)
 {
   obvsag::set_block_size_limit(2*1024*1024);
   LOG_INFO("vector index create params: ", K(index_type), KCSTRING(dtype), KCSTRING(metric), K(use_reorder), K(doc_prune_ratio), K(window_size), KP(allocator), K(extra_info_size));
+#ifdef OB_ENABLE_CUVS
+  if (index_lib == 2) {
+    return obcuvs::create_index(index_handler, static_cast<obvsag::IndexType>(index_type), dtype, metric,
+                                use_reorder, doc_prune_ratio, window_size, allocator, extra_info_size);
+  }
+#else
+  if (index_lib == 2) return OB_NOT_SUPPORTED;
+#endif
   return obvsag::create_index(index_handler, static_cast<obvsag::IndexType>(index_type),
                                    dtype, metric, use_reorder, doc_prune_ratio, window_size,
                                    allocator, extra_info_size);
@@ -125,33 +151,51 @@ int create_index(obvsag::VectorIndexPtr &index_handler, int index_type, const ch
 
 int build_index(obvsag::VectorIndexPtr index_handler, float* vector_list, int64_t* ids, int dim, int size, char* extra_info /*= nullptr*/)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::build_index(index_handler, vector_list, ids, dim, size, extra_info);
+  #endif
   return obvsag::build_index(index_handler, vector_list, ids, dim, size, extra_info);
 }
 
 int build_index(obvsag::VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids,
     int size, char *extra_infos /*= nullptr*/)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::build_index(index_handler, lens, dims, vals, ids, size, extra_infos);
+  #endif
   return obvsag::build_index(index_handler, lens, dims, vals, ids, size, extra_infos);
 }
 
 int add_index(obvsag::VectorIndexPtr index_handler, float* vector_list, int64_t* ids, int dim, char *extra_info, int size)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::add_index(index_handler, vector_list, ids, dim, size, extra_info);
+  #endif
   return obvsag::add_index(index_handler, vector_list, ids, dim, size, extra_info);
 }
 
 int add_index(obvsag::VectorIndexPtr &index_handler, uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size,
     char *extra_infos)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::add_index(index_handler, lens, dims, vals, ids, size, extra_infos);
+  #endif
   return obvsag::add_index(index_handler, lens, dims, vals, ids, size, extra_infos);
 }
 
 int get_index_number(obvsag::VectorIndexPtr index_handler, int64_t &size)
 {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::get_index_number(index_handler, size);
+    #endif
     return obvsag::get_index_number(index_handler, size);
 }
 
 int get_index_type(obvsag::VectorIndexPtr index_handler)
 {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::get_index_type(index_handler);
+    #endif
     return obvsag::get_index_type(index_handler);
 }
 
@@ -161,6 +205,9 @@ int cal_distance_by_id(obvsag::VectorIndexPtr index_handler,
                        int64_t count,
                        const float *&distances)
 {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::cal_distance_by_id(index_handler, vector, ids, count, distances);
+    #endif
     return obvsag::cal_distance_by_id(index_handler, vector, ids, count, distances);
 }
 
@@ -170,18 +217,27 @@ int cal_distance_by_id(obvsag::VectorIndexPtr index_handler,
                        int64_t count,
                        const float *&distances)
 {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::cal_distance_by_id(index_handler, len, dims, vals, ids, count, distances);
+    #endif
     return obvsag::cal_distance_by_id(index_handler, len, dims, vals, ids, count, distances);
 }
 
 int get_vid_bound(obvsag::VectorIndexPtr index_handler, int64_t &min_vid, int64_t &max_vid)
 {
-    return obvsag::get_vid_bound(index_handler, min_vid, max_vid);
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::get_vid_bound(index_handler, min_vid, max_vid);
+  #endif
+  return obvsag::get_vid_bound(index_handler, min_vid, max_vid);
 }
 
 int get_extra_info_by_ids(obvsag::VectorIndexPtr& index_handler, 
                           const int64_t* ids, 
                           int64_t count, 
                           char *extra_infos) {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::get_extra_info_by_ids(index_handler, ids, count, extra_infos);
+    #endif
     return obvsag::get_extra_info_by_ids(index_handler, ids, count, extra_infos);
 }
 
@@ -190,6 +246,11 @@ int knn_search(obvsag::VectorIndexPtr index_handler, float* query_vector,int dim
                void* invalid, bool reverse_filter, bool is_extra_info_filter, float valid_ratio, void *allocator, bool need_extra_info,
                float distance_threshold)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::knn_search(index_handler, query_vector, dim, topk,
+      result_dist, result_ids, result_size, ef_search, need_extra_info, extra_info, invalid,
+      reverse_filter, is_extra_info_filter, valid_ratio, allocator, distance_threshold);
+  #endif
   return obvsag::knn_search(index_handler, query_vector, dim, topk,
                                   result_dist, result_ids, result_size, 
                                   ef_search, need_extra_info, extra_info, 
@@ -202,6 +263,11 @@ int knn_search(obvsag::VectorIndexPtr index_handler, float* query_vector,int dim
                void* invalid, bool reverse_filter, bool is_extra_info_filter, float valid_ratio, void *allocator,
                bool need_extra_info, void *&iter_ctx, bool is_last_search)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::knn_search(index_handler, query_vector, dim, topk,
+      result_dist, result_ids, result_size, ef_search, need_extra_info, extra_info, invalid,
+      reverse_filter, is_extra_info_filter, valid_ratio, iter_ctx, is_last_search, allocator);
+  #endif
   return obvsag::knn_search(index_handler, query_vector, dim, topk,
                                 result_dist, result_ids, result_size, 
                                 ef_search, need_extra_info, extra_info, 
@@ -214,6 +280,11 @@ int knn_search(obvsag::VectorIndexPtr index_handler, uint32_t len, uint32_t *dim
     void *invalid, bool reverse_filter,
     bool is_extra_info_filter, float valid_ratio, void *allocator, bool need_extra_info)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::knn_search(index_handler, len, dims, vals, topk,
+      result_dist, result_ids, extra_info, result_size, query_prune_ratio, n_candidate, invalid,
+      reverse_filter, is_extra_info_filter, valid_ratio, allocator, need_extra_info);
+  #endif
   return obvsag::knn_search(index_handler, len, dims, vals, topk,
                                   result_dist, result_ids, extra_info, result_size, 
                                   query_prune_ratio, n_candidate,  
@@ -223,16 +294,25 @@ int knn_search(obvsag::VectorIndexPtr index_handler, uint32_t len, uint32_t *dim
 
 int fserialize(obvsag::VectorIndexPtr index_handler, std::ostream& out_stream)
 {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::fserialize(index_handler, out_stream);
+    #endif
     return obvsag::fserialize(index_handler, out_stream);
 }
 
 int fdeserialize(obvsag::VectorIndexPtr& index_handler, std::istream& in_stream)
 {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::fdeserialize(index_handler, in_stream);
+    #endif
     return obvsag::fdeserialize(index_handler,in_stream);
 }
 
 int delete_index(obvsag::VectorIndexPtr& index_handler)
 {
+    #ifdef OB_ENABLE_CUVS
+    if (obcuvs::is_index(index_handler)) return obcuvs::delete_index(index_handler);
+    #endif
     return obvsag::delete_index(index_handler);
 }
 
@@ -244,11 +324,17 @@ void delete_iter_ctx(void *iter_ctx)
 // return byte
 uint64_t estimate_memory(obvsag::VectorIndexPtr& index_handler, const uint64_t row_count, const bool is_build)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::estimate_memory(index_handler, row_count, is_build);
+  #endif
   return obvsag::estimate_memory(index_handler, row_count, is_build);
 }
 
 int immutable_optimize(obvsag::VectorIndexPtr& index_handler)
 {
+  #ifdef OB_ENABLE_CUVS
+  if (obcuvs::is_index(index_handler)) return obcuvs::immutable_optimize(index_handler);
+  #endif
   return obvsag::immutable_optimize(index_handler);
 }
 
