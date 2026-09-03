@@ -44,6 +44,7 @@ int ObServer::get_lower_bound_freeze_info(const int64_t snapshot_version, share:
 #include "lib/task/ob_timer_monitor.h"
 #include "lib/task/ob_timer_service.h" // ObTimerService
 #include "lib/trace/ob_trace.h"
+#include "lib/utility/ob_platform_utils.h"
 #include "lib/utility/utility.h"
 #include "observer/ob_server_utils.h"
 #include "observer/ob_server_options.h"
@@ -1988,10 +1989,10 @@ int ObServer::init_pre_setting()
     const int64_t stack_size = std::max(static_cast<int64_t>(default_stack_size), static_cast<int64_t>(GCONF.stack_size));
     LOG_INFO("set stack_size", K(stack_size));
     global_thread_stack_size = stack_size - THREAD_STACK_RESERVED_SIZE - ACHUNK_PRESERVE_SIZE;
-#ifdef __APPLE__
-    const int ps = getpagesize();
-    global_thread_stack_size = (global_thread_stack_size + ps - 1) & ~(ps - 1);
-#endif
+    const ssize_t page_size = lib::ob_get_page_size();
+    if (page_size > 0) {
+      global_thread_stack_size -= global_thread_stack_size % page_size;
+    }
   }
   if (OB_SUCC(ret) && GCONF.use_ipv6) {
     enable_use_ipv6();

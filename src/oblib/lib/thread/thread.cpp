@@ -121,6 +121,27 @@ int Thread::start()
     if (pret == 0) {
       stop_ = false;
       pret = pthread_create(&pth_, &attr, __th_start, this);
+      // Some Linux/WSL libc builds reject the protected heap-backed stack
+      // with EINVAL even though pthread_attr_setstack accepted it. Retry
+      // once with a libc-managed stack so a non-critical stack optimization
+      // cannot prevent the database from starting.
+#if !defined(__APPLE__) && !defined(__ANDROID__) && !defined(_WIN32)
+      if (pret == EINVAL && stack_addr_ != nullptr) {
+        LOG_WARN("pthread create rejected protected stack; retry with system stack",
+                 K(pret), K(stack_size_));
+        destroy_stack();
+        if (need_destroy) {
+          pthread_attr_destroy(&attr);
+          need_destroy = false;
+        }
+        pret = pthread_attr_init(&attr);
+        if (pret == 0) {
+          need_destroy = true;
+          stop_ = false;
+          pret = pthread_create(&pth_, &attr, __th_start, this);
+        }
+      }
+#endif
       if (pret != 0) {
         LOG_ERROR("pthread create failed", K(pret), K(errno));
 #ifdef _WIN32
