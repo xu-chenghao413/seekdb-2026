@@ -13,6 +13,8 @@ concurrency:
 jobs:
   sync:
     name: Merge master into develop
+    # Upstream maintains develop; personal competition repositories may not.
+    if: ${{ github.repository == 'oceanbase/seekdb' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
