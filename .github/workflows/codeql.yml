@@ -1,34 +1,48 @@
 name: CodeQL
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 0 * * 1" # every Monday
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   codeql:
     runs-on: ubuntu-22.04
     steps:
-    - name: Maximize build space
-      uses: easimon/maximize-build-space@master
-      with:
-        root-reserve-mb: 20480 # reserve for CodeQL
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-docker-images: 'true'
+    - name: Free unused runner disk space
+      shell: bash
+      run: |
+        set -euo pipefail
+        # /mnt can share the root filesystem on hosted runners. LVM loop images
+        # would consume the space needed by the CodeQL tool cache and temp files.
+        sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        df -h / "$RUNNER_TEMP" "$RUNNER_TOOL_CACHE" "$GITHUB_WORKSPACE"
 
     - name: Install ubuntu environment
       shell: bash
       run: |
         export DEBIAN_FRONTEND=noninteractive
         sudo apt-get update
-        sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5
+        sudo apt-get install -y git wget curl rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3
 
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v5
+
+    - name: Setup Rust
+      uses: ./.github/actions/setup-rust
+      with:
+        cache: 'false'
 
     - name: Cache deps
       id: cache-deps
-      uses: actions/cache@v3
+      uses: actions/cache@v5
       env:
         cache-name: cache-deps
       with:
@@ -36,22 +50,21 @@ jobs:
         path: deps/3rd
 
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v2
+      uses: github/codeql-action/init@v4
       with:
-        languages: cpp
+        languages: c-cpp
+        build-mode: manual
 
     - name: Build project
       shell: bash
       run: |
-        if [[ -f ~/.bashrc ]]; then
-          source ~/.bashrc
-        fi
+        set -euo pipefail
         ./build.sh release --init
-        cd build_release && make -j3
+        cd build_release && make -j3 seekdb
         test -x src/observer/seekdb
         test -x src/observer/observer
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v2
+      uses: github/codeql-action/analyze@v4
       with:
         category: "/language:cpp"
